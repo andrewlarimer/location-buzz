@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bert
+  labels:
+    app: seotoolz
+spec:
+  selector:
+    matchLabels:
+      app: seotoolz
+      role: embeddings
+      tier: backend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: seotoolz
+        role: embeddings
+        tier: backend
+    spec:
+      containers:
+      - name: bert
+        image: us.icr.io/ns_seotoolz/bert-as-service
+        ports:
+        - containerPort: 5555
+        - containerPort: 5556

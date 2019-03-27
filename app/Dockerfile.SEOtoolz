@@ -1,0 +1,23 @@
+FROM frolvlad/alpine-python-machinelearning
+
+# Copy just the requirements.txt file for now to utilize layers
+COPY ./requirements.txt /app/requirements.txt
+
+# Set the working directory to /app
+WORKDIR /app
+
+RUN apk add libzmq libpng-dev freetype-dev gcc g++ python3-dev linux-headers
+
+RUN pip install --upgrade pip
+RUN pip install --trusted-host pypi.python.org -r requirements.txt
+
+# Make port 80 available to the world outside this container
+EXPOSE 80
+
+RUN python -c "import nltk; nltk.download('vader_lexicon')"
+
+# Copy the rest of the current directory contents into the container at /app
+COPY . /app
+
+# Run app.py when the container launches
+CMD ["python", "app.py"]

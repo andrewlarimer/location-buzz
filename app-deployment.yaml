@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: seotoolz-svc
+  labels:
+    app: seotoolz
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    nodePort: 31385
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: seotoolz
+    role: app
+    tier: frontend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seotoolz-app
+  labels:
+    app: seotoolz
+spec:
+  selector:
+    matchLabels:
+      app: seotoolz
+      role: app
+      tier: frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: seotoolz
+        role: app
+        tier: frontend
+    spec:
+      containers:
+      - name: seotoolz
+        image: us.icr.io/ns_seotoolz/seotoolz
+        env:
+        - name: GMAPS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: gmapskey
+              key: gmaps_key.txt
+        - name: GET_HOSTS_FROM
+          value: dns
+        ports:
+        - containerPort: 80

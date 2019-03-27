@@ -1,0 +1,7 @@
+flask
+beautifulsoup4
+requests
+bert-serving-client
+googlemaps
+scikit-learn
+nltk

@@ -1,0 +1,4 @@
+data:text/csv;charset=utf-8,
+  {% for count in results.wordcounts %}
+  {{count.token}},{{count.count}}/n
+  {% endfor %}
