@@ -8,7 +8,7 @@ from bert_serving.client import BertClient
 import requests
 import json
 from collections import defaultdict, Counter
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import numpy as np
 import pandas as pd
 import os
@@ -16,8 +16,9 @@ import socket
 
 
 def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
-    SENTIMENT_EMPHASIS = 15
+    NEGATIVE_EMPHASIS = 2
     N_CLUSTERS_PER_SENTI = 3
+    NUM_BERT_PODS = 3
 
     gmaps_key = os.environ['GMAPS_API_KEY']
     try:
@@ -49,124 +50,145 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
 
     # ### Isolate their Place IDs and search and fetch their reviews (currently top 20 locations)
 
-    list_of_ids = list()
+    loc_ids = list()
     for location in search_results['results']:
-        list_of_ids.append(location['place_id'])
+        loc_ids.append(location['place_id'])
 
-    list_of_location_details = list()
-    for location_id in list_of_ids:
+    loc_details = list()
+    for loc_id in loc_ids:
         try:
-            list_of_location_details.append(gm.place(place_id=location_id, fields=["name", "formatted_address", "rating", "review"]))
+            loc_details.append(gm.place(place_id=loc_id, fields=["name", "formatted_address", "rating", "review"]))
         except:
-            print(f"could not find place for location id: {location_id}")
+            print(f"could not find place for location id: {loc_id}")
 
 
     # ### Split the retrieved reviews by sentence, clean them, and prep them for encoding
 
-    review_list_segmented = []
-    address_list = []
-    review_list_map_to_unsegmented_idx = []
+    seg_rev_list = []
+    seg_text = []
+    loc_addresses = []
+    seg_map_to_rev_and_loc = []
 
-    review_text = []
+    rev_text = []
+    rev_num = 0
 
-    review_num = 0
-
-    for place_idx, location_details in enumerate(list_of_location_details):
-        address_list.append(location_details['result']['formatted_address'])
+    for loc_idx, location_details in enumerate(loc_details):
+        loc_addresses.append(location_details['result']['formatted_address'])
         for review in location_details['result']['reviews']:
             this_review = review['text']
             if this_review != "":
-                review_text.append(this_review)
+                rev_text.append(this_review)
                 # Creating (review_segment, review_id) tuples for each segment in the reviews
-                for review_segment in re.findall(r"[\w’', /:-]+(.m.)?[\w’' ,/:-]+", this_review):
+                for review_segment in re.findall(r"\w[\w’', %/:-?]+(?:.m.)?[\w’'% ,/:-]*", this_review):
                     if len(review_segment.strip()) < 2:
                         continue
+                    # Counting if it's more than 20 tokens and splitting further if so
                     tokenized_review_segment = review_segment.split(' ')
                     if len(tokenized_review_segment) < 20:
-                        review_list_segmented.append(review_segment.lower().strip())
-                        review_list_map_to_unsegmented_idx.append((review_num,place_idx))
+                        seg_text.append(review_segment.strip())
+                        seg_rev_list.append(review_segment.lower().strip())
+                        seg_map_to_rev_and_loc.append((rev_num,loc_idx))
                     else:
                         while len(tokenized_review_segment) >= 20:
                             review_start = " ".join(tokenized_review_segment[:20])
-                            review_list_segmented.append(review_start.lower().strip())
-                            review_list_map_to_unsegmented_idx.append((review_num,place_idx))
-                            review_segment = " ".join(tokenized_review_segment[20:])
-                            tokenized_review_segment = review_segment.split(' ')
-                review_num += 1
+                            seg_text.append(review_start.strip())
+                            seg_rev_list.append(review_start.lower().strip())
+                            seg_map_to_rev_and_loc.append((rev_num,loc_idx))
+                            tokenized_review_segment = tokenized_review_segment[20:]
+                rev_num += 1
 
-    print(f"Requesting embeddings of {len(review_list_segmented)} review segments.")
+    print(f"Requesting embeddings of {len(seg_rev_list)} review segments.")
 
     # ### Get the BERT embeddings
-
-    review_encodings = bc.encode(review_list_segmented, show_tokens=False)
+    
+    seg_encodings = bc.encode(seg_rev_list, show_tokens=False)
 
     # ### Get sentiment embeddings
 
-    sentiment_embeddings = []
+    print(f"Accumulating sentiment of {len(seg_rev_list)} review segments and locations.")
 
     sentibot = SentimentIntensityAnalyzer()
 
-    print(f"Requesting sentinment of {len(review_list_segmented)} review segments.")
+    seg_senti = []
+    rev_dict_cumm_senti = defaultdict(lambda: (float(), [])) #float for accumulated sentiment, list for seg indices
+    loc_dict_cumm_senti = defaultdict(lambda: (float(), []))
 
-    for review_snippet in review_list_segmented:
-        vader_results = sentibot.polarity_scores(review_snippet)
-        sentiment_embeddings.append(vader_results)
-
-    # ### Concatenate sentiment embeddings with the BERT embeddings
-
-    print(f"Combining embeddings and sentiment...")
-
-    aug_encodings = []
-
-    current_idx = (None, None)
-    current_sentiment = [0] * 3
-    current_bert = [0] * 768
-    current_bert_norm = 0
-    new_lists_index = 0
-
-    sent_scores_by_list_of_ids_idx = defaultdict(int)
+    for i, segmented_review in enumerate(seg_rev_list):
+        senti_result = sentibot.polarity_scores(segmented_review)
+        this_senti =  senti_result['pos'] - senti_result['neg'] * NEGATIVE_EMPHASIS
+        rev_senti_so_far, rev_indices_so_far = rev_dict_cumm_senti[seg_map_to_rev_and_loc[i][0]]
+        rev_dict_cumm_senti[seg_map_to_rev_and_loc[i][0]] = (round(rev_senti_so_far + this_senti, 1), rev_indices_so_far + [i])
+        loc_senti_so_far, loc_indices_so_far = loc_dict_cumm_senti[seg_map_to_rev_and_loc[i][1]]
+        loc_dict_cumm_senti[seg_map_to_rev_and_loc[i][1]] = (round(loc_senti_so_far + this_senti, 1), loc_indices_so_far + [i])
 
     positive_indices = []
     neutral_indices = []
     negative_indices = []
 
-    for i, encoding in enumerate(review_encodings):
-        if review_list_map_to_unsegmented_idx[i] == current_idx:
-            # We are continuing with more parts of a review, so we add the sentiment
-            senti = sentiment_embeddings[i]
-            current_sentiment = np.add(current_sentiment, np.multiply([senti['pos'], senti['neu'], senti['neg']], SENTIMENT_EMPHASIS))
-            # We want the topic encoding with the largest magnitude from each review.
-            this_norm = np.linalg.norm(encoding)
-            if this_norm > current_bert_norm:
-                current_bert_norm = this_norm
-                current_bert = encoding
-            # Comment out above and uncomment below to have cummulative topic encodings
-            #current_bert = np.add(current_bert, encoding)
-        else:
-            # We are dealing with a new topic, so we add the previous topic.
-            if current_bert_norm > 0:
-                aug_encodings.append(np.append(current_bert,current_sentiment))
+    for k, v in rev_dict_cumm_senti.items():
+        cumm_senti, this_indices = v
+        if cumm_senti < 0:
+            negative_indices += this_indices
+        elif cumm_senti < 1:
+            neutral_indices += this_indices
+        elif cumm_senti >= 1:
+            positive_indices += this_indices
 
-                # Add to the score accumulation by location
-                cumm_senti_rating = round(current_sentiment[0] - current_sentiment[2],2)
-                sent_scores_by_list_of_ids_idx[review_list_map_to_unsegmented_idx[i][1]] = round(sent_scores_by_list_of_ids_idx[review_list_map_to_unsegmented_idx[i][1]] + cumm_senti_rating, 1)
+    # ### Concatenate sentiment embeddings with the BERT embeddings
 
-                #Sort this index by sentiment.
-                if cumm_senti_rating < -3:
-                    negative_indices.append(new_lists_index)
-                elif cumm_senti_rating < 3:
-                    neutral_indices.append(new_lists_index)
-                elif cumm_senti_rating >= 3:
-                    positive_indices.append(new_lists_index)
+    # print(f"Combining embeddings and sentiment...")
 
-                new_lists_index += 1
+    # aug_encodings = []
 
-            # Reset our per-review scores to this one.
-            current_bert_norm = np.linalg.norm(encoding)
-            current_bert = encoding
-            senti = sentiment_embeddings[i]
-            current_sentiment = np.multiply([senti['pos'], senti['neu'], senti['neg']], SENTIMENT_EMPHASIS)
-            current_idx = review_list_map_to_unsegmented_idx[i]
+    # current_idx = (None, None)
+    # current_sentiment = [0] * 3
+    # current_bert = [0] * 768
+    # current_bert_norm = 0
+    # new_lists_index = 0
+
+    # sent_scores_by_list_of_ids_idx = defaultdict(int)
+
+    # positive_indices = []
+    # neutral_indices = []
+    # negative_indices = []
+
+    # for i, encoding in enumerate(seg_encodings):
+    #     if seg_map_to_rev_and_loc[i] == current_idx:
+    #         # We are continuing with more parts of a review, so we add the sentiment
+    #         senti = seg_senti[i]
+    #         current_sentiment = np.add(current_sentiment, np.multiply([senti['pos'], senti['neu'], senti['neg']], SENTIMENT_EMPHASIS))
+    #         # We want the topic encoding with the largest magnitude from each review.
+    #         this_norm = np.linalg.norm(encoding)
+    #         if this_norm > current_bert_norm:
+    #             current_bert_norm = this_norm
+    #             current_bert = encoding
+    #         # Comment out above and uncomment below to have cummulative topic encodings
+    #         #current_bert = np.add(current_bert, encoding)
+    #     else:
+    #         # We are dealing with a new topic, so we add the previous topic.
+    #         if current_bert_norm > 0:
+    #             aug_encodings.append(np.append(current_bert,current_sentiment))
+
+    #             # Add to the score accumulation by location
+    #             cumm_senti_rating = round(current_sentiment[0] - current_sentiment[2],2)
+    #             sent_scores_by_list_of_ids_idx[seg_map_to_rev_and_loc[i][1]] = round(sent_scores_by_list_of_ids_idx[seg_map_to_rev_and_loc[i][1]] + cumm_senti_rating, 1)
+
+    #             #Sort this index by sentiment.
+    #             if cumm_senti_rating < -3:
+    #                 negative_indices.append(new_lists_index)
+    #             elif cumm_senti_rating < 3:
+    #                 neutral_indices.append(new_lists_index)
+    #             elif cumm_senti_rating >= 3:
+    #                 positive_indices.append(new_lists_index)
+
+    #             new_lists_index += 1
+
+    #         # Reset our per-review scores to this one.
+    #         current_bert_norm = np.linalg.norm(encoding)
+    #         current_bert = encoding
+    #         senti = seg_senti[i]
+    #         current_sentiment = np.multiply([senti['pos'], senti['neu'], senti['neg']], SENTIMENT_EMPHASIS)
+    #         current_idx = seg_map_to_rev_and_loc[i]
 
     # Repeat this one last time for the last encoding
     # aug_encodings.append(np.append(current_bert,current_sentiment))
@@ -177,7 +199,7 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
     # elif cumm_senti_rating >= 3:
     #     positive_indices.append(new_lists_index)
 
-    def cluster_from_indices(indices_list, input_encodings = aug_encodings, input_text = review_text, n_clusters=N_CLUSTERS_PER_SENTI):
+    def cluster_from_indices(indices_list, input_encodings = seg_encodings, input_text =seg_text, n_clusters=N_CLUSTERS_PER_SENTI):
         encodings = []
         text = []
 
@@ -189,13 +211,17 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
             n_clusters = len(encodings)
 
         km = KMeans(n_clusters=n_clusters, max_iter=2400)
-        clust_labels = km.fit_predict(encodings)
+        seg_labels = km.fit_predict(encodings)
+        seg_distances_to_all_ks = km.transform(encodings)
+        seg_distance_to_nearest_k = []
+        for i, label in enumerate(seg_labels):
+            seg_distance_to_nearest_k.append(seg_distances_to_all_ks[i,label])
 
-        return clust_labels, text
+        return seg_labels, seg_distance_to_nearest_k, text
 
-    pos_clust_labels, pos_clust_text = cluster_from_indices(positive_indices)
-    neu_clust_labels, neu_clust_text = cluster_from_indices(neutral_indices)
-    neg_clust_labels, neg_clust_text = cluster_from_indices(negative_indices)
+    pos_clust_labels, pos_clust_dist, pos_clust_text = cluster_from_indices(positive_indices)
+    neu_clust_labels, neu_clust_dist, neu_clust_text = cluster_from_indices(neutral_indices)
+    neg_clust_labels, neg_clust_dist, neg_clust_text = cluster_from_indices(negative_indices)
 
     # ### Identify Most Common Clustering Results
 
@@ -213,7 +239,7 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
                 "again", "further", "then", "once", "here", "there", "when", "where",
                 "why", "how", "all", "any", "both", "each", "few", "more", "most",
                 "other", "some", "such", "no", "nor", "not", "only", "own", "same",
-                "so", "than", "too", "very", "s", "t", "can", "will", "just",
+                "so", "than", "too", "very", "didn", "s", "t", "can", "will", "just",
                 "should", "", "best", "top", "unbelievable", "see", "xa", "br",
                 "ul", "li", ".", "it's", "m", "re", "ve", "d", CHAIN_NAME.lower()}
 
@@ -232,15 +258,41 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
     neu_most_common = get_most_common_words_per_cluster(neu_clust_labels, neu_clust_text)
     neg_most_common = get_most_common_words_per_cluster(neg_clust_labels, neg_clust_text)
 
-    def package_for_return(labels, text, most_common_words):
+    def package_for_return(labels, seg_text, rev_text, most_common_words, clust_dist, indices):
+
         cluster_dict = defaultdict(dict)
+
+        full_text = []
+        loc_ids = []
+        rev_nums = []
+
+        used_reviews = set()
+
+        for i, seg in enumerate(seg_text):
+            original_seg_index = indices[i]
+            rev_num, loc_idx = seg_map_to_rev_and_loc[original_seg_index]
+            full_text.append(rev_text[rev_num])
+            loc_ids.append(loc_idx)
+            rev_nums.append(rev_num)
+
+        sort_order = np.argsort(np.array(clust_dist))
+
+        sorted_labels = list(np.array(labels)[sort_order])
+        sorted_seg_text = list(np.array(seg_text)[sort_order])
+        sorted_full_text = list(np.array(full_text)[sort_order])
+        sorted_loc_idx = list(np.array(loc_ids)[sort_order])
+        sorted_rev_num = list(np.array(rev_nums)[sort_order])
 
         for idx, word_list in enumerate(most_common_words):
             cluster_dict[idx]['most_common_words'] = word_list
             cluster_dict[idx]['cluster_reviews'] = list()
 
-        for idx, label in enumerate(labels):
-            cluster_dict[label]['cluster_reviews'].append(text[idx])
+        for idx, label in enumerate(sorted_labels):
+            if sorted_rev_num[idx] not in used_reviews:
+                used_reviews.add(sorted_rev_num[idx])
+                match_string = r'(' + re.escape(sorted_seg_text[idx]) + r')'
+                new_text = re.sub(match_string, r'<strong>\1</strong>', sorted_full_text[idx])
+                cluster_dict[label]['cluster_reviews'].append(new_text + "&quot; - Said about Location #" + str(sorted_loc_idx[idx] + 1))
 
         return cluster_dict
 
@@ -250,9 +302,9 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
         #     }
         # }
 
-    pos_clusters = package_for_return(pos_clust_labels, pos_clust_text, pos_most_common)
-    neu_clusters = package_for_return(neu_clust_labels, neu_clust_text, neu_most_common)
-    neg_clusters = package_for_return(neg_clust_labels, neg_clust_text, neg_most_common)
+    pos_clusters = package_for_return(pos_clust_labels, pos_clust_text, rev_text, pos_most_common, pos_clust_dist, positive_indices)
+    neu_clusters = package_for_return(neu_clust_labels, neu_clust_text, rev_text, neu_most_common, neu_clust_dist, neutral_indices)
+    neg_clusters = package_for_return(neg_clust_labels, neg_clust_text, rev_text, neg_most_common, neg_clust_dist, negative_indices)
 
     #     review_clusters_top3 = dict()
 
@@ -282,12 +334,12 @@ def evaluate(CHAIN_NAME='starbucks', CITY_NAME='austin', RADIUS='50000'):
 
     # ### Ranked positivity score by location
 
-    sentiment_ranked_locations = sorted(sent_scores_by_list_of_ids_idx.items(), key=lambda kv: -kv[1])
+    sentiment_ranked_locations = sorted(loc_dict_cumm_senti.items(), key=lambda x: -x[1][0])
 
     # ### Packaging things up to be returned
 
     return_package = {'city_name': CITY_NAME, 'chain_name': CHAIN_NAME,
-                      'location_addresses': address_list,
+                      'location_addresses': loc_addresses,
                       'location_ranks_and_scores':sentiment_ranked_locations,
                       'pos_clusters':pos_clusters,
                       'neu_clusters':neu_clusters,

@@ -4,4 +4,4 @@ requests
 bert-serving-client
 googlemaps
 scikit-learn
-nltk
+vaderSentiment
